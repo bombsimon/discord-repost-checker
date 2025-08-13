@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-const DISCORD_CONFIG: &str = include_str!("../discord.yaml");
 const CHECKPOINT_FILE: &str = "checkpoint.json";
 
 /// [`DiscordConfig`] represents all the configuration required for Discord.
@@ -278,7 +277,10 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("discord_repost"))
         .init();
 
-    let config: DiscordConfig = serde_yaml::from_str(DISCORD_CONFIG).expect("Invalid config");
+    let config: DiscordConfig = serde_yaml::from_str(
+        &std::fs::read_to_string("discord.yaml").expect("Failed to read config"),
+    )
+    .expect("Invalid config");
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
     let repost_checker = Arc::new(Mutex::new(
         RepostChecker::load(config.always_enabled_urls).unwrap(),
@@ -336,3 +338,4 @@ mod test {
         assert!(rc.stats().contains("Totalt har det postats 1 unik"));
     }
 }
+
