@@ -197,7 +197,7 @@ struct Handler {
 impl EventHandler for Handler {
     /// The message hook is fired on every message in the channel.
     async fn message(&self, ctx: Context, message: Message) {
-        if message.is_own(&ctx) {
+        if message.author.id == ctx.cache.current_user().id {
             log::debug!("Skipping message from bot");
             return;
         }
