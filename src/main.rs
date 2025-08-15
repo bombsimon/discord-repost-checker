@@ -1,13 +1,13 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serenity::async_trait;
 use serenity::builder::CreateMessage;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
+use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-const CHECKPOINT_FILE: &str = "checkpoint.json";
+const DATABASE_URL: &str = "sqlite:repost_checker.db";
 
 /// [`DiscordConfig`] represents all the configuration required for Discord.
 #[derive(Debug, Clone, Deserialize)]
@@ -16,17 +16,11 @@ struct DiscordConfig {
     always_enabled_urls: HashSet<String>,
 }
 
-type Reposts = HashMap<String, Vec<(UserId, chrono::DateTime<chrono::Local>)>>;
-
 /// [`RepostChecker`] is the storage of posted URLs, by whom and when it was posted. It's used to
 /// check for already posted links.
-#[derive(Serialize, Deserialize)]
 struct RepostChecker {
-    reposts: Reposts,
-    ignore_urls: HashSet<String>,
-    #[serde(skip, default = "default_regex")]
+    pool: SqlitePool,
     regex_pattern: regex::Regex,
-    #[serde(default)]
     always_enabled_urls: HashSet<String>,
 }
 
@@ -37,39 +31,57 @@ fn default_regex() -> regex::Regex {
 }
 
 impl RepostChecker {
-    /// Create a new empty [`RepostChecker`] without any reposts or URLs to ignore. Should be used
-    /// if there's no existing state.
-    fn new(always_enabled_urls: HashSet<String>) -> Self {
-        Self {
-            reposts: Default::default(),
-            ignore_urls: Default::default(),
+    /// Create a new [`RepostChecker`] with database connection
+    async fn new(always_enabled_urls: HashSet<String>) -> Result<Self, sqlx::Error> {
+        Self::new_with_url(DATABASE_URL, always_enabled_urls).await
+    }
+
+    /// Create a new [`RepostChecker`] with custom database URL (useful for testing)
+    async fn new_with_url(database_url: &str, always_enabled_urls: HashSet<String>) -> Result<Self, sqlx::Error> {
+        let pool = SqlitePool::connect(database_url).await?;
+        
+        // Create tables if they don't exist
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS reposts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                posted_at TEXT NOT NULL
+            );
+            
+            CREATE TABLE IF NOT EXISTS ignore_urls (
+                domain TEXT PRIMARY KEY
+            );
+            
+            CREATE TABLE IF NOT EXISTS always_enabled_urls (
+                domain TEXT PRIMARY KEY
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_reposts_url ON reposts(url);
+            "#
+        )
+        .execute(&pool)
+        .await?;
+        
+        // Insert always_enabled_urls into database
+        for domain in &always_enabled_urls {
+            sqlx::query("INSERT OR IGNORE INTO always_enabled_urls (domain) VALUES (?)")
+                .bind(domain)
+                .execute(&pool)
+                .await?;
+        }
+        
+        Ok(Self {
+            pool,
             regex_pattern: default_regex(),
             always_enabled_urls,
-        }
+        })
     }
 
-    /// Load an existing state of reposts from a JSON file. If the file doesn't exist it will fall
-    /// back to return an empty [`RepostChecker`].
-    fn load(always_enabled_urls: HashSet<String>) -> std::io::Result<Self> {
-        match std::fs::File::open(CHECKPOINT_FILE) {
-            Ok(file) => {
-                let mut me: RepostChecker = serde_json::from_reader(file)?;
-                me.always_enabled_urls.extend(always_enabled_urls);
-
-                Ok(me)
-            }
-            _ => Ok(Self::new(always_enabled_urls)),
-        }
-    }
-
-    /// Write the current state to disk to persist it. Will overwrite any existing file.
-    fn checkpoint(&self) -> std::io::Result<()> {
-        let file = std::fs::File::create(CHECKPOINT_FILE)?;
-        let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &self)?;
-        writer.flush()?;
-
-        Ok(())
+    /// Load existing state and setup database
+    async fn load(always_enabled_urls: HashSet<String>) -> Result<Self, sqlx::Error> {
+        Self::new(always_enabled_urls).await
     }
 
     /// Extract all URLs from a test string. Used to check if a Discord message contains any URLs
@@ -83,66 +95,102 @@ impl RepostChecker {
 
     /// Check if the passed URL has been posted before. If so, return a message saying how many
     /// times and by which user it's been posted.
-    fn check_repost(&self, u: &url::Url, _channel_id: ChannelId) -> Option<String> {
+    async fn check_repost(&self, u: &url::Url, _channel_id: ChannelId) -> Option<String> {
         let url_str = u.to_string();
+        let host = u.host_str().unwrap_or_default();
 
-        if self.ignore_urls.contains(u.host_str().unwrap_or_default()) {
+        // Check if this domain is ignored
+        let ignored = sqlx::query("SELECT 1 FROM ignore_urls WHERE domain = ?")
+            .bind(host)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or(None);
+
+        if ignored.is_some() {
             return None;
         }
 
-        match self.reposts.get(&url_str) {
-            Some(repost) if !repost.is_empty() => {
-                let seen_count = repost.len();
-                let times_text = if seen_count == 1 { "gång" } else { "gånger" };
-                let repost_list = repost
-                    .iter()
-                    .map(|(user_id, when)| {
-                        let uid = UserId::from(user_id).mention();
-                        format!("- {uid} - {}", when.format("%Y-%m-%d %H:%M:%S"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+        // Get all reposts for this URL
+        let reposts = sqlx::query("SELECT user_id, posted_at FROM reposts WHERE url = ? ORDER BY posted_at")
+            .bind(&url_str)
+            .fetch_all(&self.pool)
+            .await
+            .ok()?;
 
-                Some(format!(
-                    "{url_str} har postats {} {}!\n{}",
-                    seen_count, times_text, repost_list
-                ))
-            }
-            _ => None,
+        if reposts.is_empty() {
+            return None;
         }
+
+        let seen_count = reposts.len();
+        let times_text = if seen_count == 1 { "gång" } else { "gånger" };
+        let repost_list = reposts
+            .iter()
+            .map(|row| {
+                let user_id: String = row.get("user_id");
+                let posted_at: String = row.get("posted_at");
+                let uid = UserId::from(user_id.parse::<u64>().unwrap_or(0)).mention();
+                format!("- {uid} - {posted_at}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Some(format!(
+            "{url_str} har postats {} {}!\n{}",
+            seen_count, times_text, repost_list
+        ))
     }
 
     /// Add a URL as seen by the passed `user_id`.
-    fn add_url(&mut self, u: &url::Url, user_id: UserId, _channel_id: ChannelId) {
-        self.reposts
-            .entry(u.to_string())
-            .or_default()
-            .push((user_id, chrono::offset::Local::now()))
+    async fn add_url(&self, u: &url::Url, user_id: UserId, _channel_id: ChannelId) -> Result<(), sqlx::Error> {
+        let url_str = u.to_string();
+        let user_id_str = user_id.to_string();
+        let now = chrono::offset::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        
+        sqlx::query("INSERT INTO reposts (url, user_id, posted_at) VALUES (?, ?, ?)")
+            .bind(&url_str)
+            .bind(&user_id_str)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+            
+        Ok(())
     }
 
-    fn add_site_to_ignore(&mut self, content: &str) -> Option<String> {
+    async fn add_site_to_ignore(&self, content: &str) -> Option<String> {
         let urls = self.extract_urls(content);
         let site = urls
             .first()
             .and_then(|u| u.host_str().map(|h| h.to_string()))?;
 
-        if self.ignore_urls.contains(&site) {
+        // Check if already ignored
+        let already_ignored = sqlx::query("SELECT 1 FROM ignore_urls WHERE domain = ?")
+            .bind(&site)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or(None)
+            .is_some();
+
+        if already_ignored {
             return None;
         }
 
         if self.always_enabled_urls.contains(&site) {
             Some(format!("Sorry, det går inte att stänga av {site}"))
         } else {
-            self.ignore_urls.insert(site.clone());
-            if let Err(err) = self.checkpoint() {
-                log::error!("Failed to checkpoint: {err}");
+            if let Err(err) = sqlx::query("INSERT INTO ignore_urls (domain) VALUES (?)")
+                .bind(&site)
+                .execute(&self.pool)
+                .await 
+            {
+                log::error!("Failed to add site to ignore list: {err}");
+                return None;
             }
 
             Some(format!("Ok, ska sluta rapportera från {site}"))
         }
     }
 
-    fn stats(&self) -> String {
+    async fn stats(&self) -> String {
         #[derive(Default)]
         struct Posts {
             total: u64,
@@ -150,16 +198,37 @@ impl RepostChecker {
         }
 
         let mut stats: HashMap<UserId, Posts> = HashMap::new();
-        let mut total_urls = 0u64;
+        
+        // Get total unique URLs
+        let total_urls: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT url) FROM reposts")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(0);
 
-        for posts in self.reposts.values() {
-            total_urls += 1;
+        // Get all reposts ordered by URL and then by posted_at
+        let all_reposts = sqlx::query("SELECT url, user_id FROM reposts ORDER BY url, posted_at")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default();
 
-            for (i, post) in posts.iter().enumerate() {
-                let entry = stats.entry(post.0).or_default();
-                entry.total += 1;
-                entry.reposts += if i > 0 { 1 } else { 0 };
+        let mut current_url = String::new();
+        let mut url_post_count = 0;
+        
+        for row in all_reposts {
+            let url: String = row.get("url");
+            let user_id_str: String = row.get("user_id");
+            let user_id = UserId::from(user_id_str.parse::<u64>().unwrap_or(0));
+            
+            if url != current_url {
+                current_url = url;
+                url_post_count = 0;
             }
+            
+            let entry = stats.entry(user_id).or_default();
+            entry.total += 1;
+            entry.reposts += if url_post_count > 0 { 1 } else { 0 };
+            
+            url_post_count += 1;
         }
 
         let mut s = String::new();
@@ -189,7 +258,7 @@ impl RepostChecker {
 
 /// The [`Handler`] implements the Discord trait to listen for messages and reactions.
 struct Handler {
-    repost_checker: Arc<Mutex<RepostChecker>>,
+    repost_checker: Arc<RepostChecker>,
 }
 
 #[async_trait]
@@ -201,7 +270,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let messages = self.get_messages_to_send(&ctx, &message);
+        let messages = self.get_messages_to_send(&ctx, &message).await;
 
         for message_text in messages {
             let msg = CreateMessage::new()
@@ -226,8 +295,7 @@ impl EventHandler for Handler {
             ReactionType::Unicode(emoji)
                 if ["👎", "👎🏻", "👎🏼", "👎🏽", "👎🏿"].contains(&emoji.as_str()) =>
             {
-                let mut rc = self.repost_checker.lock().unwrap();
-                rc.add_site_to_ignore(&message.content)
+                self.repost_checker.add_site_to_ignore(&message.content).await
             }
             _ => return,
         };
@@ -241,31 +309,27 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
-    fn get_messages_to_send(&self, ctx: &Context, message: &Message) -> Vec<String> {
-        let mut rc = self.repost_checker.lock().unwrap();
-
-        let bot = ctx.cache().unwrap().current_user();
-        if message.mentions.contains(&bot) && message.content.ends_with("stats") {
-            return vec![rc.stats()];
+    async fn get_messages_to_send(&self, ctx: &Context, message: &Message) -> Vec<String> {
+        let bot_id = ctx.cache().unwrap().current_user().id;
+        if message.mentions.iter().any(|u| u.id == bot_id) && message.content.ends_with("stats") {
+            return vec![self.repost_checker.stats().await];
         }
 
         let mut messages = Vec::new();
 
-        let urls = rc.extract_urls(&message.content);
+        let urls = self.repost_checker.extract_urls(&message.content);
         if urls.is_empty() {
             return messages;
         }
 
         for u in urls {
-            if let Some(repost) = rc.check_repost(&u, message.channel_id) {
+            if let Some(repost) = self.repost_checker.check_repost(&u, message.channel_id).await {
                 messages.push(repost);
             }
 
-            rc.add_url(&u, message.author.id, message.channel_id);
-        }
-
-        if let Err(err) = rc.checkpoint() {
-            log::error!("Failed to checkpoint: {err}");
+            if let Err(err) = self.repost_checker.add_url(&u, message.author.id, message.channel_id).await {
+                log::error!("Failed to add URL: {err}");
+            }
         }
 
         messages
@@ -282,9 +346,9 @@ async fn main() {
     )
     .expect("Invalid config");
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
-    let repost_checker = Arc::new(Mutex::new(
-        RepostChecker::load(config.always_enabled_urls).unwrap(),
-    ));
+    let repost_checker = Arc::new(
+        RepostChecker::load(config.always_enabled_urls).await.expect("Failed to initialize database"),
+    );
     let mut client = Client::builder(config.token, intents)
         .event_handler(Handler { repost_checker })
         .await
@@ -302,9 +366,9 @@ async fn main() {
 mod test {
     use super::*;
 
-    #[test]
-    fn test_parse_url() {
-        let rc = RepostChecker::new(Default::default());
+    #[tokio::test]
+    async fn test_parse_url() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:", Default::default()).await.unwrap();
         let content = r#"
             Hello,
             https://www.thegithubshop.com/1455317-00-miirr-vacuum-insulated-hatchback-bottle äkta utvecklare
@@ -317,25 +381,25 @@ mod test {
         assert_eq!(3, rc.extract_urls(content).len());
     }
 
-    #[test]
-    fn test_check_repost() {
-        let mut rc = RepostChecker::new(Default::default());
+    #[tokio::test]
+    async fn test_check_repost() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:", Default::default()).await.unwrap();
 
         let u = url::Url::parse("https://svt.se").unwrap();
-        assert!(rc.check_repost(&u, 1u64.into()).is_none());
+        assert!(rc.check_repost(&u, 1u64.into()).await.is_none());
 
-        rc.add_url(&u, 123.into(), 1u64.into());
-        assert!(rc.check_repost(&u, 1u64.into()).is_some());
+        rc.add_url(&u, 123.into(), 1u64.into()).await.unwrap();
+        assert!(rc.check_repost(&u, 1u64.into()).await.is_some());
     }
 
-    #[test]
-    fn test_stats() {
-        let mut rc = RepostChecker::new(Default::default());
+    #[tokio::test]
+    async fn test_stats() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:", Default::default()).await.unwrap();
 
         let u = url::Url::parse("https://svt.se").unwrap();
-        rc.add_url(&u, 123.into(), 1u64.into());
+        rc.add_url(&u, 123.into(), 1u64.into()).await.unwrap();
 
-        assert!(rc.stats().contains("Totalt har det postats 1 unik"));
+        assert!(rc.stats().await.contains("Totalt har det postats 1 unik"));
     }
 }
 
