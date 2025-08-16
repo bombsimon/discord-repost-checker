@@ -3,7 +3,6 @@ use serenity::builder::CreateMessage;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
 use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 /// The path to the SQLite database.
@@ -257,65 +256,64 @@ impl RepostChecker {
     }
 
     async fn stats(&self) -> String {
-        #[derive(Default)]
-        struct Posts {
-            total: u64,
-            reposts: u64,
-        }
-
-        let mut stats: HashMap<UserId, Posts> = HashMap::new();
-
         // Get total unique URLs
         let total_urls: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT url) FROM reposts")
             .fetch_one(&self.pool)
             .await
             .unwrap_or(0);
 
-        // Get all reposts ordered by URL and then by posted_at
-        let all_reposts = sqlx::query("SELECT url, user_id FROM reposts ORDER BY url, posted_at")
-            .fetch_all(&self.pool)
-            .await
-            .unwrap_or_default();
-
-        let mut current_url = String::new();
-        let mut url_post_count = 0;
-
-        for row in all_reposts {
-            let url: String = row.get("url");
-            let user_id_str: String = row.get("user_id");
-            let user_id = UserId::from(user_id_str.parse::<u64>().unwrap_or(0));
-
-            if url != current_url {
-                current_url = url;
-                url_post_count = 0;
-            }
-
-            let entry = stats.entry(user_id).or_default();
-            entry.total += 1;
-            entry.reposts += if url_post_count > 0 { 1 } else { 0 };
-
-            url_post_count += 1;
-        }
+        // Get user stats using SQL aggregation
+        let user_stats = sqlx::query(
+            r#"
+            WITH user_posts AS (
+                SELECT 
+                    user_id,
+                    url,
+                    posted_at,
+                    ROW_NUMBER() OVER (PARTITION BY url ORDER BY posted_at) as post_order
+                FROM reposts
+            ),
+            user_aggregates AS (
+                SELECT 
+                    user_id,
+                    COUNT(*) as total_posts,
+                    COUNT(CASE WHEN post_order > 1 THEN 1 END) as repost_count
+                FROM user_posts
+                GROUP BY user_id
+            )
+            SELECT 
+                user_id,
+                total_posts,
+                repost_count,
+                CASE 
+                    WHEN total_posts = 0 THEN 0
+                    ELSE ROUND((repost_count * 100.0) / total_posts)
+                END as repost_percentage
+            FROM user_aggregates
+            ORDER BY total_posts DESC
+            "#
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
 
         let mut s = String::new();
-        s.push_str(format!("Totalt har det postats {total_urls} unika länkar\n").as_str());
+        s.push_str(&format!("Totalt har det postats {total_urls} unika länkar\n"));
 
-        for (user_id, posts) in stats {
-            let repost_percentage = if posts.reposts == 0 {
-                0f64
-            } else {
-                (posts.reposts as f64 / posts.total as f64) * 100.
-            };
-            s.push_str(
-                format!(
-                    "- {}: {} ({} reposts, {}%)\n",
-                    user_id.mention(),
-                    posts.total,
-                    posts.reposts,
-                    repost_percentage as i16,
-                )
-                .as_str(),
-            );
+        for row in user_stats {
+            let user_id_str: String = row.get("user_id");
+            let user_id = UserId::from(user_id_str.parse::<u64>().unwrap_or(0));
+            let total_posts: i64 = row.get("total_posts");
+            let repost_count: i64 = row.get("repost_count");
+            let repost_percentage: f64 = row.get("repost_percentage");
+
+            s.push_str(&format!(
+                "- {}: {} ({} reposts, {}%)\n",
+                user_id.mention(),
+                total_posts,
+                repost_count,
+                repost_percentage as i64,
+            ));
         }
 
         s
