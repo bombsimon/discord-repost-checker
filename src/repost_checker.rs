@@ -356,10 +356,22 @@ mod test {
             .await
             .unwrap();
 
-        let u = url::Url::parse("https://svt.se").unwrap();
-        rc.add_url(&u, 123.into(), 1u64.into()).await.unwrap();
+        let u1 = url::Url::parse("https://svt.se").unwrap();
+        let u2 = url::Url::parse("https://aftonbladet.se").unwrap();
 
-        assert!(rc.stats().await.contains("Totalt har det postats 1 unik"));
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 789.into(), 1u64.into()).await.unwrap();
+
+        rc.add_url(&u2, 456.into(), 1u64.into()).await.unwrap();
+
+        let expected = r#"Totalt har det postats 2 unika länkar
+- <@456>: 2 (1 reposts, 50%)
+- <@123>: 1 (0 reposts, 0%)
+- <@789>: 1 (1 reposts, 100%)
+"#;
+
+        assert_eq!(rc.stats().await, expected);
     }
 
     #[tokio::test]
