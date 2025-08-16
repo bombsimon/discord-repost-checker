@@ -1,93 +1,73 @@
-use serde::Deserialize;
 use serenity::async_trait;
 use serenity::builder::CreateMessage;
 use serenity::model::prelude::*;
 use serenity::prelude::*;
-use sqlx::{Row, SqlitePool};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
+/// The path to the SQLite database.
 const DATABASE_URL: &str = "sqlite:repost_checker.db";
 
-/// [`DiscordConfig`] represents all the configuration required for Discord.
-#[derive(Debug, Clone, Deserialize)]
-struct DiscordConfig {
-    token: String,
-    always_enabled_urls: HashSet<String>,
-}
+/// The regex used to find URLs. It only cares about anything that starts with the `http` or
+/// `https` protocol.
+static URL_REGEX: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"https?://\S+").expect("Invalid regex"));
 
 /// [`RepostChecker`] is the storage of posted URLs, by whom and when it was posted. It's used to
 /// check for already posted links.
 struct RepostChecker {
     pool: SqlitePool,
-    regex_pattern: regex::Regex,
-    always_enabled_urls: HashSet<String>,
-}
-
-/// The regex used to find URLs. It only cares about anything that starts with the `http` or
-/// `https` protocol.
-fn default_regex() -> regex::Regex {
-    regex::Regex::new(r"https?://\S+").expect("Invalid regex")
 }
 
 impl RepostChecker {
     /// Create a new [`RepostChecker`] with database connection
-    async fn new(always_enabled_urls: HashSet<String>) -> Result<Self, sqlx::Error> {
-        Self::new_with_url(DATABASE_URL, always_enabled_urls).await
+    async fn new() -> Result<Self, sqlx::Error> {
+        Self::new_with_url(DATABASE_URL).await
     }
 
     /// Create a new [`RepostChecker`] with custom database URL (useful for testing)
-    async fn new_with_url(database_url: &str, always_enabled_urls: HashSet<String>) -> Result<Self, sqlx::Error> {
-        let pool = SqlitePool::connect(database_url).await?;
-        
+    async fn new_with_url(database_url: &str) -> Result<Self, sqlx::Error> {
+        let pool = if database_url == "sqlite::memory:" {
+            SqlitePool::connect(database_url).await?
+        } else {
+            let options = SqliteConnectOptions::new()
+                .filename(database_url.strip_prefix("sqlite:").unwrap_or(database_url))
+                .create_if_missing(true);
+
+            SqlitePool::connect_with(options).await?
+        };
+
         // Create tables if they don't exist
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS reposts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
                 user_id TEXT NOT NULL,
                 posted_at TEXT NOT NULL
             );
             
-            CREATE TABLE IF NOT EXISTS ignore_urls (
-                domain TEXT PRIMARY KEY
+            CREATE TABLE IF NOT EXISTS ignore_hosts (
+                host TEXT PRIMARY KEY
             );
             
-            CREATE TABLE IF NOT EXISTS always_enabled_urls (
-                domain TEXT PRIMARY KEY
+            CREATE TABLE IF NOT EXISTS always_enabled_hosts (
+                host TEXT PRIMARY KEY
             );
             
             CREATE INDEX IF NOT EXISTS idx_reposts_url ON reposts(url);
-            "#
+            "#,
         )
         .execute(&pool)
         .await?;
-        
-        // Insert always_enabled_urls into database
-        for domain in &always_enabled_urls {
-            sqlx::query("INSERT OR IGNORE INTO always_enabled_urls (domain) VALUES (?)")
-                .bind(domain)
-                .execute(&pool)
-                .await?;
-        }
-        
-        Ok(Self {
-            pool,
-            regex_pattern: default_regex(),
-            always_enabled_urls,
-        })
-    }
 
-    /// Load existing state and setup database
-    async fn load(always_enabled_urls: HashSet<String>) -> Result<Self, sqlx::Error> {
-        Self::new(always_enabled_urls).await
+        Ok(Self { pool })
     }
 
     /// Extract all URLs from a test string. Used to check if a Discord message contains any URLs
     /// that we need to check for repost.
     fn extract_urls(&self, source: &str) -> Vec<url::Url> {
-        self.regex_pattern
+        URL_REGEX
             .find_iter(source)
             .filter_map(|u| url::Url::parse(u.as_str()).ok())
             .collect()
@@ -100,7 +80,7 @@ impl RepostChecker {
         let host = u.host_str().unwrap_or_default();
 
         // Check if this domain is ignored
-        let ignored = sqlx::query("SELECT 1 FROM ignore_urls WHERE domain = ?")
+        let ignored = sqlx::query("SELECT 1 FROM ignore_hosts WHERE host = ?")
             .bind(host)
             .fetch_optional(&self.pool)
             .await
@@ -111,11 +91,12 @@ impl RepostChecker {
         }
 
         // Get all reposts for this URL
-        let reposts = sqlx::query("SELECT user_id, posted_at FROM reposts WHERE url = ? ORDER BY posted_at")
-            .bind(&url_str)
-            .fetch_all(&self.pool)
-            .await
-            .ok()?;
+        let reposts =
+            sqlx::query("SELECT user_id, posted_at FROM reposts WHERE url = ? ORDER BY posted_at")
+                .bind(&url_str)
+                .fetch_all(&self.pool)
+                .await
+                .ok()?;
 
         if reposts.is_empty() {
             return None;
@@ -135,24 +116,30 @@ impl RepostChecker {
             .join("\n");
 
         Some(format!(
-            "{url_str} har postats {} {}!\n{}",
-            seen_count, times_text, repost_list
+            "{url_str} har postats {seen_count} {times_text}!\n{repost_list}",
         ))
     }
 
     /// Add a URL as seen by the passed `user_id`.
-    async fn add_url(&self, u: &url::Url, user_id: UserId, _channel_id: ChannelId) -> Result<(), sqlx::Error> {
+    async fn add_url(
+        &self,
+        u: &url::Url,
+        user_id: UserId,
+        _channel_id: ChannelId,
+    ) -> Result<(), sqlx::Error> {
         let url_str = u.to_string();
         let user_id_str = user_id.to_string();
-        let now = chrono::offset::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        
+        let now = chrono::offset::Local::now()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
         sqlx::query("INSERT INTO reposts (url, user_id, posted_at) VALUES (?, ?, ?)")
             .bind(&url_str)
             .bind(&user_id_str)
             .bind(&now)
             .execute(&self.pool)
             .await?;
-            
+
         Ok(())
     }
 
@@ -163,7 +150,7 @@ impl RepostChecker {
             .and_then(|u| u.host_str().map(|h| h.to_string()))?;
 
         // Check if already ignored
-        let already_ignored = sqlx::query("SELECT 1 FROM ignore_urls WHERE domain = ?")
+        let already_ignored = sqlx::query("SELECT 1 FROM ignore_hosts WHERE host = ?")
             .bind(&site)
             .fetch_optional(&self.pool)
             .await
@@ -174,20 +161,99 @@ impl RepostChecker {
             return None;
         }
 
-        if self.always_enabled_urls.contains(&site) {
+        // Check if this domain is in always_enabled_hosts
+        let always_enabled = sqlx::query("SELECT 1 FROM always_enabled_hosts WHERE host = ?")
+            .bind(&site)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or(None);
+
+        if always_enabled.is_some() {
             Some(format!("Sorry, det går inte att stänga av {site}"))
         } else {
-            if let Err(err) = sqlx::query("INSERT INTO ignore_urls (domain) VALUES (?)")
-                .bind(&site)
-                .execute(&self.pool)
-                .await 
-            {
+            if let Err(err) = self.insert_ignore_host(&site).await {
                 log::error!("Failed to add site to ignore list: {err}");
                 return None;
             }
 
             Some(format!("Ok, ska sluta rapportera från {site}"))
         }
+    }
+
+    async fn admin_add_always_enabled(&self, host: &str) -> Result<String, sqlx::Error> {
+        sqlx::query("INSERT OR IGNORE INTO always_enabled_hosts (host) VALUES (?)")
+            .bind(host)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(format!("Added {host} to always enabled hosts"))
+    }
+
+    async fn admin_remove_always_enabled(&self, host: &str) -> Result<String, sqlx::Error> {
+        sqlx::query("DELETE FROM always_enabled_hosts WHERE host = ?")
+            .bind(host)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(format!("Removed {host} from always enabled hosts"))
+    }
+
+    async fn insert_ignore_host(&self, host: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT OR IGNORE INTO ignore_hosts (host) VALUES (?)")
+            .bind(host)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn admin_add_ignore(&self, host: &str) -> Result<String, sqlx::Error> {
+        self.insert_ignore_host(host).await?;
+        Ok(format!("Added {host} to ignored hosts"))
+    }
+
+    async fn admin_remove_ignore(&self, host: &str) -> Result<String, sqlx::Error> {
+        sqlx::query("DELETE FROM ignore_hosts WHERE host = ?")
+            .bind(host)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(format!("Removed {host} from ignored hosts"))
+    }
+
+    async fn admin_list_urls(&self) -> Result<String, sqlx::Error> {
+        let always_enabled: Vec<String> =
+            sqlx::query_scalar("SELECT host FROM always_enabled_hosts ORDER BY host")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let ignored: Vec<String> =
+            sqlx::query_scalar("SELECT host FROM ignore_hosts ORDER BY host")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut result = String::new();
+
+        result.push_str("**Always Enabled Hosts:**\n");
+
+        if always_enabled.is_empty() {
+            result.push_str("(none)\n");
+        } else {
+            for domain in always_enabled {
+                result.push_str(&format!("- {}\n", domain));
+            }
+        }
+
+        result.push_str("\n**Ignored Hosts:**\n");
+        if ignored.is_empty() {
+            result.push_str("(none)\n");
+        } else {
+            for domain in ignored {
+                result.push_str(&format!("- {}\n", domain));
+            }
+        }
+
+        Ok(result)
     }
 
     async fn stats(&self) -> String {
@@ -198,7 +264,7 @@ impl RepostChecker {
         }
 
         let mut stats: HashMap<UserId, Posts> = HashMap::new();
-        
+
         // Get total unique URLs
         let total_urls: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT url) FROM reposts")
             .fetch_one(&self.pool)
@@ -213,21 +279,21 @@ impl RepostChecker {
 
         let mut current_url = String::new();
         let mut url_post_count = 0;
-        
+
         for row in all_reposts {
             let url: String = row.get("url");
             let user_id_str: String = row.get("user_id");
             let user_id = UserId::from(user_id_str.parse::<u64>().unwrap_or(0));
-            
+
             if url != current_url {
                 current_url = url;
                 url_post_count = 0;
             }
-            
+
             let entry = stats.entry(user_id).or_default();
             entry.total += 1;
             entry.reposts += if url_post_count > 0 { 1 } else { 0 };
-            
+
             url_post_count += 1;
         }
 
@@ -270,6 +336,18 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Handle DM admin commands
+        if message.guild_id.is_none() {
+            if let Some(response) = self.handle_admin_command(&ctx, &message).await {
+                let msg = CreateMessage::new().content(response);
+                if let Err(err) = message.channel_id.send_message(&ctx, msg).await {
+                    log::error!("Failed to send DM response: {err:?}");
+                }
+            }
+
+            return;
+        }
+
         let messages = self.get_messages_to_send(&ctx, &message).await;
 
         for message_text in messages {
@@ -295,7 +373,9 @@ impl EventHandler for Handler {
             ReactionType::Unicode(emoji)
                 if ["👎", "👎🏻", "👎🏼", "👎🏽", "👎🏿"].contains(&emoji.as_str()) =>
             {
-                self.repost_checker.add_site_to_ignore(&message.content).await
+                self.repost_checker
+                    .add_site_to_ignore(&message.content)
+                    .await
             }
             _ => return,
         };
@@ -318,21 +398,111 @@ impl Handler {
         let mut messages = Vec::new();
 
         let urls = self.repost_checker.extract_urls(&message.content);
+
         if urls.is_empty() {
             return messages;
         }
 
         for u in urls {
-            if let Some(repost) = self.repost_checker.check_repost(&u, message.channel_id).await {
+            if let Some(repost) = self
+                .repost_checker
+                .check_repost(&u, message.channel_id)
+                .await
+            {
                 messages.push(repost);
             }
 
-            if let Err(err) = self.repost_checker.add_url(&u, message.author.id, message.channel_id).await {
+            if let Err(err) = self
+                .repost_checker
+                .add_url(&u, message.author.id, message.channel_id)
+                .await
+            {
                 log::error!("Failed to add URL: {err}");
             }
         }
 
         messages
+    }
+
+    async fn handle_admin_command(&self, ctx: &Context, message: &Message) -> Option<String> {
+        // Check if user is admin in any mutual guild
+        if !self.is_user_admin(ctx, message.author.id).await {
+            return Some("You need administrator permissions to use admin commands.".to_string());
+        }
+
+        let content = message.content.trim();
+        let parts: Vec<&str> = content.split_whitespace().collect();
+
+        let command = parts[0];
+
+        if command == "list-urls" {
+            return match self.repost_checker.admin_list_urls().await {
+                Ok(msg) => Some(msg),
+                Err(e) => Some(format!("Error: {e}")),
+            };
+        }
+
+        if parts.len() != 2 {
+            return Some(
+                r#"
+Available commands:
+- `always-enable <host>` - Always check reposts for host
+- `always-disable <host>` - Remove host from always enabled
+- `ignore-add <host>` - Ignore reposts from host
+- `ignore-remove <host>` - Remove host from ignore list
+- `list-urls` - List all always-enabled and ignored hosts
+"#
+                .to_string(),
+            );
+        }
+
+        let host = parts[1];
+
+        match command {
+            "always-enable-add" => {
+                match self.repost_checker.admin_add_always_enabled(host).await {
+                    Ok(msg) => Some(msg),
+                    Err(e) => Some(format!("Error: {e}")),
+                }
+            }
+            "always-disable-remove" => {
+                match self.repost_checker.admin_remove_always_enabled(host).await {
+                    Ok(msg) => Some(msg),
+                    Err(e) => Some(format!("Error: {e}")),
+                }
+            }
+            "ignore-add" => {
+                match self.repost_checker.admin_add_ignore(host).await {
+                    Ok(msg) => Some(msg),
+                    Err(e) => Some(format!("Error: {e}")),
+                }
+            }
+            "ignore-remove" => {
+                match self.repost_checker.admin_remove_ignore(host).await {
+                    Ok(msg) => Some(msg),
+                    Err(e) => Some(format!("Error: {e}")),
+                }
+            }
+            _ => Some("Unknown command. Available: always-enable-add, always-enable-remove, ignore-add, ignore-remove".to_string()),
+        }
+    }
+
+    async fn is_user_admin(&self, ctx: &Context, user_id: UserId) -> bool {
+        // Check all guilds where the bot and user are both present
+        for guild_id in ctx.cache.guilds() {
+            if let Ok(member) = guild_id.member(ctx, user_id).await {
+                if let Ok(guild) = guild_id.to_partial_guild(ctx).await {
+                    // This is in fact no longer deprecated: https://github.com/serenity-rs/serenity/pull/3314
+                    #[allow(deprecated)]
+                    let permissions = guild.member_permissions(&member);
+                    if permissions.administrator() {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -341,15 +511,15 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("discord_repost"))
         .init();
 
-    let config: DiscordConfig = serde_yaml::from_str(
-        &std::fs::read_to_string("discord.yaml").expect("Failed to read config"),
-    )
-    .expect("Invalid config");
+    let token =
+        std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN environment variable must be set");
     let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
     let repost_checker = Arc::new(
-        RepostChecker::load(config.always_enabled_urls).await.expect("Failed to initialize database"),
+        RepostChecker::new()
+            .await
+            .expect("Failed to initialize database"),
     );
-    let mut client = Client::builder(config.token, intents)
+    let mut client = Client::builder(token, intents)
         .event_handler(Handler { repost_checker })
         .await
         .expect("Error creating client");
@@ -368,7 +538,9 @@ mod test {
 
     #[tokio::test]
     async fn test_parse_url() {
-        let rc = RepostChecker::new_with_url("sqlite::memory:", Default::default()).await.unwrap();
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
         let content = r#"
             Hello,
             https://www.thegithubshop.com/1455317-00-miirr-vacuum-insulated-hatchback-bottle äkta utvecklare
@@ -383,7 +555,9 @@ mod test {
 
     #[tokio::test]
     async fn test_check_repost() {
-        let rc = RepostChecker::new_with_url("sqlite::memory:", Default::default()).await.unwrap();
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
 
         let u = url::Url::parse("https://svt.se").unwrap();
         assert!(rc.check_repost(&u, 1u64.into()).await.is_none());
@@ -394,12 +568,43 @@ mod test {
 
     #[tokio::test]
     async fn test_stats() {
-        let rc = RepostChecker::new_with_url("sqlite::memory:", Default::default()).await.unwrap();
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
 
         let u = url::Url::parse("https://svt.se").unwrap();
         rc.add_url(&u, 123.into(), 1u64.into()).await.unwrap();
 
         assert!(rc.stats().await.contains("Totalt har det postats 1 unik"));
     }
-}
 
+    #[tokio::test]
+    async fn test_admin_list_urls() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Test empty lists
+        let result = rc.admin_list_urls().await.unwrap();
+        assert!(result.contains("**Always Enabled Hosts:**"));
+        assert!(result.contains("**Ignored Hosts:**"));
+        assert!(result.contains("(none)"));
+
+        // Add some domains
+        rc.admin_add_always_enabled("example.com").await.unwrap();
+        rc.admin_add_always_enabled("test.org").await.unwrap();
+        rc.admin_add_ignore("spam.net").await.unwrap();
+
+        let result = rc.admin_list_urls().await.unwrap();
+
+        // Check that domains are listed and sorted
+        assert!(result.contains("- example.com"));
+        assert!(result.contains("- test.org"));
+        assert!(result.contains("- spam.net"));
+
+        // Verify sorting (example.com should come before test.org)
+        let example_pos = result.find("- example.com").unwrap();
+        let test_pos = result.find("- test.org").unwrap();
+        assert!(example_pos < test_pos);
+    }
+}
