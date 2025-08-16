@@ -1,5 +1,0 @@
----
-token: <some-token>
-always_enabled_urls:
-  - site1.com
-  - site2.com
