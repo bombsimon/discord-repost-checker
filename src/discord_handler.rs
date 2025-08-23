@@ -75,8 +75,16 @@ impl EventHandler for Handler {
 impl Handler {
     async fn get_messages_to_send(&self, ctx: &Context, message: &Message) -> Vec<String> {
         let bot_id = ctx.cache().unwrap().current_user().id;
-        if message.mentions.iter().any(|u| u.id == bot_id) && message.content.ends_with("stats") {
-            return vec![self.repost_checker.stats().await];
+        if message.mentions.iter().any(|u| u.id == bot_id) {
+            if message.content.ends_with("stats") {
+                return vec![self.repost_checker.stats().await];
+            } else if message.content.ends_with("top domains") {
+                return vec![self.repost_checker.top_domains().await];
+            } else if message.content.ends_with("top users") {
+                return vec![self.repost_checker.top_users().await];
+            } else if message.content.ends_with("today") {
+                return vec![self.repost_checker.today_stats().await];
+            }
         }
 
         let mut messages = Vec::new();

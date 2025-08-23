@@ -314,6 +314,100 @@ impl RepostChecker {
 
         s
     }
+
+    pub async fn top_domains(&self) -> String {
+        let domain_stats = sqlx::query(
+            r#"
+            WITH domain_posts AS (
+                SELECT 
+                    CASE 
+                        WHEN url LIKE 'https://%' THEN SUBSTR(url, 9)
+                        WHEN url LIKE 'http://%' THEN SUBSTR(url, 8)
+                        ELSE url
+                    END as domain_part
+                FROM reposts
+            ),
+            domains AS (
+                SELECT 
+                    CASE 
+                        WHEN INSTR(domain_part, '/') > 0 
+                        THEN SUBSTR(domain_part, 1, INSTR(domain_part, '/') - 1)
+                        ELSE domain_part
+                    END as domain,
+                    COUNT(*) as post_count
+                FROM domain_posts
+                GROUP BY domain
+            )
+            SELECT domain, post_count
+            FROM domains
+            ORDER BY post_count DESC
+            LIMIT 5
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut s = String::new();
+        s.push_str("Top 5 domäner:\n");
+
+        if domain_stats.is_empty() {
+            s.push_str("Inga domäner hittades\n");
+        } else {
+            for (i, row) in domain_stats.iter().enumerate() {
+                let domain: String = row.get("domain");
+                let count: i64 = row.get("post_count");
+                s.push_str(&format!("{}. {} ({} länkar)\n", i + 1, domain, count));
+            }
+        }
+
+        s
+    }
+
+    pub async fn top_users(&self) -> String {
+        let user_stats = sqlx::query(
+            r#"
+            SELECT user_id, COUNT(*) as post_count
+            FROM reposts
+            GROUP BY user_id
+            ORDER BY post_count DESC
+            LIMIT 5
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        let mut s = String::new();
+        s.push_str("Top 5 användare:\n");
+
+        if user_stats.is_empty() {
+            s.push_str("Inga användare hittades\n");
+        } else {
+            for (i, row) in user_stats.iter().enumerate() {
+                let user_id_str: String = row.get("user_id");
+                let user_id = UserId::from(user_id_str.parse::<u64>().unwrap_or(0));
+                let count: i64 = row.get("post_count");
+                s.push_str(&format!("{}. {} ({} länkar)\n", i + 1, user_id.mention(), count));
+            }
+        }
+
+        s
+    }
+
+    pub async fn today_stats(&self) -> String {
+        let today = chrono::offset::Local::now().format("%Y-%m-%d").to_string();
+        
+        let today_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM reposts WHERE DATE(posted_at) = ?"
+        )
+        .bind(&today)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or(0);
+
+        format!("Idag har det postats {} länkar", today_count)
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +496,73 @@ mod test {
         let example_pos = result.find("- example.com").unwrap();
         let test_pos = result.find("- test.org").unwrap();
         assert!(example_pos < test_pos);
+    }
+
+    #[tokio::test]
+    async fn test_top_domains() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Test empty database
+        let result = rc.top_domains().await;
+        assert!(result.contains("Top 5 domäner:"));
+        assert!(result.contains("Inga domäner hittades"));
+
+        // Add some URLs
+        let u1 = url::Url::parse("https://github.com/test").unwrap();
+        let u2 = url::Url::parse("https://stackoverflow.com/questions/123").unwrap();
+        let u3 = url::Url::parse("https://github.com/another").unwrap();
+
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u2, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u3, 789.into(), 1u64.into()).await.unwrap();
+
+        let result = rc.top_domains().await;
+        assert!(result.contains("1. github.com (2 länkar)"));
+        assert!(result.contains("2. stackoverflow.com (1 länkar)"));
+    }
+
+    #[tokio::test]
+    async fn test_top_users() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Test empty database
+        let result = rc.top_users().await;
+        assert!(result.contains("Top 5 användare:"));
+        assert!(result.contains("Inga användare hittades"));
+
+        // Add some URLs
+        let u1 = url::Url::parse("https://example.com/1").unwrap();
+        let u2 = url::Url::parse("https://example.com/2").unwrap();
+        let u3 = url::Url::parse("https://example.com/3").unwrap();
+
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u2, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u3, 456.into(), 1u64.into()).await.unwrap();
+
+        let result = rc.top_users().await;
+        assert!(result.contains("1. <@123> (2 länkar)"));
+        assert!(result.contains("2. <@456> (1 länkar)"));
+    }
+
+    #[tokio::test]
+    async fn test_today_stats() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        let result = rc.today_stats().await;
+        assert!(result.contains("Idag har det postats 0 länkar"));
+
+        // Add a URL for today
+        let u1 = url::Url::parse("https://example.com").unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+
+        let result = rc.today_stats().await;
+        assert!(result.contains("Idag har det postats 1 länkar"));
     }
 }
 
