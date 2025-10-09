@@ -139,12 +139,19 @@ impl Handler {
         if parts.len() != 2 {
             return Some(
                 r#"
-Available commands:
+**Admin Commands (DM only):**
 - `always-enable <host>` - Always check reposts for host
 - `always-disable <host>` - Remove host from always enabled
 - `ignore-add <host>` - Ignore reposts from host
 - `ignore-remove <host>` - Remove host from ignore list
 - `list-urls` - List all always-enabled and ignored hosts
+
+**Channel Commands (mention the bot):**
+- `@bot stats` - Show total unique links and user statistics
+- `@bot top domains` - Show top 5 most posted domains
+- `@bot top users` - Show top 5 users by link count
+- `@bot top user-domains` - Show top domains for each user
+- `@bot today` - Show number of links posted today
 "#
                 .to_string(),
             );
