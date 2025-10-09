@@ -82,6 +82,8 @@ impl Handler {
                 return vec![self.repost_checker.top_domains().await];
             } else if message.content.ends_with("top users") {
                 return vec![self.repost_checker.top_users().await];
+            } else if message.content.ends_with("top user-domains") {
+                return vec![self.repost_checker.top_domains_by_user().await];
             } else if message.content.ends_with("today") {
                 return vec![self.repost_checker.today_stats().await];
             }
@@ -197,4 +199,3 @@ Available commands:
         false
     }
 }
-

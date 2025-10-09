@@ -319,8 +319,8 @@ impl RepostChecker {
         let domain_stats = sqlx::query(
             r#"
             WITH domain_posts AS (
-                SELECT 
-                    CASE 
+                SELECT
+                    CASE
                         WHEN url LIKE 'https://%' THEN SUBSTR(url, 9)
                         WHEN url LIKE 'http://%' THEN SUBSTR(url, 8)
                         ELSE url
@@ -328,9 +328,9 @@ impl RepostChecker {
                 FROM reposts
             ),
             domains AS (
-                SELECT 
-                    CASE 
-                        WHEN INSTR(domain_part, '/') > 0 
+                SELECT
+                    CASE
+                        WHEN INSTR(domain_part, '/') > 0
                         THEN SUBSTR(domain_part, 1, INSTR(domain_part, '/') - 1)
                         ELSE domain_part
                     END as domain,
@@ -388,7 +388,12 @@ impl RepostChecker {
                 let user_id_str: String = row.get("user_id");
                 let user_id = UserId::from(user_id_str.parse::<u64>().unwrap_or(0));
                 let count: i64 = row.get("post_count");
-                s.push_str(&format!("{}. {} ({} länkar)\n", i + 1, user_id.mention(), count));
+                s.push_str(&format!(
+                    "{}. {} ({} länkar)\n",
+                    i + 1,
+                    user_id.mention(),
+                    count
+                ));
             }
         }
 
@@ -397,16 +402,101 @@ impl RepostChecker {
 
     pub async fn today_stats(&self) -> String {
         let today = chrono::offset::Local::now().format("%Y-%m-%d").to_string();
-        
-        let today_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM reposts WHERE DATE(posted_at) = ?"
-        )
-        .bind(&today)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or(0);
+
+        let today_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reposts WHERE DATE(posted_at) = ?")
+                .bind(&today)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(0);
 
         format!("Idag har det postats {} länkar", today_count)
+    }
+
+    pub async fn top_domains_by_user(&self) -> String {
+        let user_domains = sqlx::query(
+            r#"
+            WITH domain_posts AS (
+                SELECT
+                    user_id,
+                    CASE
+                        WHEN url LIKE 'https://%' THEN SUBSTR(url, 9)
+                        WHEN url LIKE 'http://%' THEN SUBSTR(url, 8)
+                        ELSE url
+                    END as domain_part
+                FROM reposts
+            ),
+            user_domains AS (
+                SELECT
+                    user_id,
+                    CASE
+                        WHEN INSTR(domain_part, '/') > 0
+                        THEN SUBSTR(domain_part, 1, INSTR(domain_part, '/') - 1)
+                        ELSE domain_part
+                    END as domain,
+                    COUNT(*) as post_count
+                FROM domain_posts
+                GROUP BY user_id, domain
+            ),
+            user_top_domains AS (
+                SELECT
+                    user_id,
+                    domain,
+                    post_count,
+                    ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY post_count DESC) as rank
+                FROM user_domains
+            )
+            SELECT user_id, domain, post_count
+            FROM user_top_domains
+            WHERE rank <= 5
+            ORDER BY user_id, post_count DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        if user_domains.is_empty() {
+            return "Inga domäner hittades".to_string();
+        }
+
+        let mut result = String::new();
+        result.push_str("Top domäner per användare:\n");
+
+        let mut current_user: Option<String> = None;
+        let mut user_domains_list: Vec<String> = Vec::new();
+
+        for row in user_domains {
+            let user_id_str: String = row.get("user_id");
+            let domain: String = row.get("domain");
+            let count: i64 = row.get("post_count");
+
+            if current_user.as_ref() != Some(&user_id_str) {
+                if let Some(user) = current_user {
+                    let user_id = UserId::from(user.parse::<u64>().unwrap_or(0));
+                    result.push_str(&format!(
+                        "- {}: {}\n",
+                        user_id.mention(),
+                        user_domains_list.join(", ")
+                    ));
+                }
+                current_user = Some(user_id_str.clone());
+                user_domains_list.clear();
+            }
+
+            user_domains_list.push(format!("{} ({})", domain, count));
+        }
+
+        if let Some(user) = current_user {
+            let user_id = UserId::from(user.parse::<u64>().unwrap_or(0));
+            result.push_str(&format!(
+                "- {}: {}\n",
+                user_id.mention(),
+                user_domains_list.join(", ")
+            ));
+        }
+
+        result
     }
 }
 
@@ -564,5 +654,39 @@ mod test {
         let result = rc.today_stats().await;
         assert!(result.contains("Idag har det postats 1 länkar"));
     }
-}
 
+    #[tokio::test]
+    async fn test_top_domains_by_user() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Test empty database
+        let result = rc.top_domains_by_user().await;
+        assert!(result.contains("Inga domäner hittades"));
+
+        // Add URLs from different users and domains
+        let u1 = url::Url::parse("https://github.com/test1").unwrap();
+        let u2 = url::Url::parse("https://github.com/test2").unwrap();
+        let u3 = url::Url::parse("https://stackoverflow.com/q1").unwrap();
+        let u4 = url::Url::parse("https://reddit.com/post1").unwrap();
+        let u5 = url::Url::parse("https://github.com/test3").unwrap();
+        let u6 = url::Url::parse("https://stackoverflow.com/q2").unwrap();
+
+        // User 123 posts to github (3 times) and stackoverflow (1 time)
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u2, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u5, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u3, 123.into(), 1u64.into()).await.unwrap();
+
+        // User 456 posts to stackoverflow (2 times) and reddit (1 time)
+        rc.add_url(&u6, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u3, 456.into(), 1u64.into()).await.unwrap(); // repost
+        rc.add_url(&u4, 456.into(), 1u64.into()).await.unwrap();
+
+        let result = rc.top_domains_by_user().await;
+        assert!(result.contains("Top domäner per användare:"));
+        assert!(result.contains("<@123>: github.com (3), stackoverflow.com (1)"));
+        assert!(result.contains("<@456>: stackoverflow.com (2), reddit.com (1)"));
+    }
+}
