@@ -61,14 +61,18 @@ impl EventHandler for Handler {
                     .add_site_to_ignore(&message.content)
                     .await
             }
+            ReactionType::Unicode(emoji) if emoji == "❓" => {
+                self.repost_checker
+                    .add_site_to_preserve_full_url(&message.content)
+                    .await
+            }
             _ => return,
         };
 
-        if let Some(response) = response {
-            if let Err(err) = message.channel_id.say(&ctx, response).await {
+        if let Some(response) = response
+            && let Err(err) = message.channel_id.say(&ctx, response).await {
                 log::error!("Failed to send message: {err:?}");
             }
-        }
     }
 }
 
@@ -140,11 +144,13 @@ impl Handler {
             return Some(
                 r#"
 **Admin Commands (DM only):**
-- `always-enable <host>` - Always check reposts for host
-- `always-disable <host>` - Remove host from always enabled
+- `always-enable-add <host>` - Always check reposts for host
+- `always-enable-remove <host>` - Remove host from always enabled
 - `ignore-add <host>` - Ignore reposts from host
 - `ignore-remove <host>` - Remove host from ignore list
-- `list-urls` - List all always-enabled and ignored hosts
+- `preserve-full-url-add <host>` - Match full URLs (with query strings) for host
+- `preserve-full-url-remove <host>` - Remove host from preserve full URL list
+- `list-urls` - List all configured hosts
 
 **Channel Commands (mention the bot):**
 - `@bot stats` - Show total unique links and user statistics
@@ -166,7 +172,7 @@ impl Handler {
                     Err(e) => Some(format!("Error: {e}")),
                 }
             }
-            "always-disable-remove" => {
+            "always-enable-remove" => {
                 match self.repost_checker.admin_remove_always_enabled(host).await {
                     Ok(msg) => Some(msg),
                     Err(e) => Some(format!("Error: {e}")),
@@ -184,15 +190,27 @@ impl Handler {
                     Err(e) => Some(format!("Error: {e}")),
                 }
             }
-            _ => Some("Unknown command. Available: always-enable-add, always-enable-remove, ignore-add, ignore-remove".to_string()),
+            "preserve-full-url-add" => {
+                match self.repost_checker.admin_add_preserve_full_url(host).await {
+                    Ok(msg) => Some(msg),
+                    Err(e) => Some(format!("Error: {e}")),
+                }
+            }
+            "preserve-full-url-remove" => {
+                match self.repost_checker.admin_remove_preserve_full_url(host).await {
+                    Ok(msg) => Some(msg),
+                    Err(e) => Some(format!("Error: {e}")),
+                }
+            }
+            _ => Some("Unknown command. Available: always-enable-add, always-enable-remove, ignore-add, ignore-remove, preserve-full-url-add, preserve-full-url-remove".to_string()),
         }
     }
 
     async fn is_user_admin(&self, ctx: &Context, user_id: UserId) -> bool {
         // Check all guilds where the bot and user are both present
         for guild_id in ctx.cache.guilds() {
-            if let Ok(member) = guild_id.member(ctx, user_id).await {
-                if let Ok(guild) = guild_id.to_partial_guild(ctx).await {
+            if let Ok(member) = guild_id.member(ctx, user_id).await
+                && let Ok(guild) = guild_id.to_partial_guild(ctx).await {
                     // This is in fact no longer deprecated: https://github.com/serenity-rs/serenity/pull/3314
                     #[allow(deprecated)]
                     let permissions = guild.member_permissions(&member);
@@ -200,7 +218,6 @@ impl Handler {
                         return true;
                     }
                 }
-            }
         }
 
         false

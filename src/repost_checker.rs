@@ -39,15 +39,19 @@ impl RepostChecker {
                 user_id TEXT NOT NULL,
                 posted_at TEXT NOT NULL
             );
-            
+
             CREATE TABLE IF NOT EXISTS ignore_hosts (
                 host TEXT PRIMARY KEY
             );
-            
+
             CREATE TABLE IF NOT EXISTS always_enabled_hosts (
                 host TEXT PRIMARY KEY
             );
-            
+
+            CREATE TABLE IF NOT EXISTS preserve_full_url_hosts (
+                host TEXT PRIMARY KEY
+            );
+
             CREATE INDEX IF NOT EXISTS idx_reposts_url ON reposts(url);
             "#,
         )
@@ -64,6 +68,14 @@ impl RepostChecker {
             .find_iter(source)
             .filter_map(|u| url::Url::parse(u.as_str()).ok())
             .collect()
+    }
+
+    /// Sanitize a URL by removing query strings and fragments
+    fn sanitize_url(u: &url::Url) -> String {
+        let mut sanitized = u.clone();
+        sanitized.set_query(None);
+        sanitized.set_fragment(None);
+        sanitized.to_string()
     }
 
     /// Check if the passed URL has been posted before. If so, return a message saying how many
@@ -83,13 +95,33 @@ impl RepostChecker {
             return None;
         }
 
+        // Check if this host requires exact URL matching
+        let preserve_full_url = sqlx::query("SELECT 1 FROM preserve_full_url_hosts WHERE host = ?")
+            .bind(host)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or(None)
+            .is_some();
+
         // Get all reposts for this URL
-        let reposts =
+        let reposts = if preserve_full_url {
+            // Use exact match for hosts that need full URL matching
             sqlx::query("SELECT user_id, posted_at FROM reposts WHERE url = ? ORDER BY posted_at")
                 .bind(&url_str)
                 .fetch_all(&self.pool)
                 .await
-                .ok()?;
+                .ok()?
+        } else {
+            // Use LIKE query to match URLs ignoring query strings and fragments
+            let sanitized = Self::sanitize_url(u);
+            sqlx::query(
+                "SELECT user_id, posted_at FROM reposts WHERE url LIKE ? ORDER BY posted_at",
+            )
+            .bind(format!("{sanitized}%"))
+            .fetch_all(&self.pool)
+            .await
+            .ok()?
+        };
 
         if reposts.is_empty() {
             return None;
@@ -173,6 +205,32 @@ impl RepostChecker {
         }
     }
 
+    pub async fn add_site_to_preserve_full_url(&self, content: &str) -> Option<String> {
+        let urls = self.extract_urls(content);
+        let site = urls
+            .first()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))?;
+
+        // Check if already in preserve list
+        let already_preserved = sqlx::query("SELECT 1 FROM preserve_full_url_hosts WHERE host = ?")
+            .bind(&site)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or(None)
+            .is_some();
+
+        if already_preserved {
+            return None;
+        }
+
+        if let Err(err) = self.insert_preserve_full_url_host(&site).await {
+            log::error!("Failed to add site to preserve full URL list: {err}");
+            return None;
+        }
+
+        Some(format!("Ok, ska matcha fullständiga URLer från {site}"))
+    }
+
     pub async fn admin_add_always_enabled(&self, host: &str) -> Result<String, sqlx::Error> {
         sqlx::query("INSERT OR IGNORE INTO always_enabled_hosts (host) VALUES (?)")
             .bind(host)
@@ -200,6 +258,15 @@ impl RepostChecker {
         Ok(())
     }
 
+    async fn insert_preserve_full_url_host(&self, host: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT OR IGNORE INTO preserve_full_url_hosts (host) VALUES (?)")
+            .bind(host)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn admin_add_ignore(&self, host: &str) -> Result<String, sqlx::Error> {
         self.insert_ignore_host(host).await?;
         Ok(format!("Added {host} to ignored hosts"))
@@ -214,6 +281,20 @@ impl RepostChecker {
         Ok(format!("Removed {host} from ignored hosts"))
     }
 
+    pub async fn admin_add_preserve_full_url(&self, host: &str) -> Result<String, sqlx::Error> {
+        self.insert_preserve_full_url_host(host).await?;
+        Ok(format!("Added {host} to preserve full URL hosts"))
+    }
+
+    pub async fn admin_remove_preserve_full_url(&self, host: &str) -> Result<String, sqlx::Error> {
+        sqlx::query("DELETE FROM preserve_full_url_hosts WHERE host = ?")
+            .bind(host)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(format!("Removed {host} from preserve full URL hosts"))
+    }
+
     pub async fn admin_list_urls(&self) -> Result<String, sqlx::Error> {
         let always_enabled: Vec<String> =
             sqlx::query_scalar("SELECT host FROM always_enabled_hosts ORDER BY host")
@@ -222,6 +303,11 @@ impl RepostChecker {
 
         let ignored: Vec<String> =
             sqlx::query_scalar("SELECT host FROM ignore_hosts ORDER BY host")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let preserve_full_url: Vec<String> =
+            sqlx::query_scalar("SELECT host FROM preserve_full_url_hosts ORDER BY host")
                 .fetch_all(&self.pool)
                 .await?;
 
@@ -242,6 +328,15 @@ impl RepostChecker {
             result.push_str("(none)\n");
         } else {
             for domain in ignored {
+                result.push_str(&format!("- {}\n", domain));
+            }
+        }
+
+        result.push_str("\n**Preserve Full URL Hosts:**\n");
+        if preserve_full_url.is_empty() {
+            result.push_str("(none)\n");
+        } else {
+            for domain in preserve_full_url {
                 result.push_str(&format!("- {}\n", domain));
             }
         }
@@ -688,5 +783,68 @@ mod test {
         assert!(result.contains("Top domäner per användare:"));
         assert!(result.contains("<@123>: github.com (3), stackoverflow.com (1)"));
         assert!(result.contains("<@456>: stackoverflow.com (2), reddit.com (1)"));
+    }
+
+    #[tokio::test]
+    async fn test_url_sanitization() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Add a URL with query string and fragment
+        let u1 =
+            url::Url::parse("https://example.com/page?utm_source=twitter&foo=bar#section").unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+
+        // Try to check for the same URL with different query params - should match by default
+        let u2 = url::Url::parse("https://example.com/page?different=params").unwrap();
+        let result = rc.check_repost(&u2, 1u64.into()).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("har postats 1 gång"));
+
+        // Try with no query string at all - should also match
+        let u3 = url::Url::parse("https://example.com/page").unwrap();
+        let result = rc.check_repost(&u3, 1u64.into()).await;
+        assert!(result.is_some());
+
+        // Try with fragment only - should also match
+        let u4 = url::Url::parse("https://example.com/page#different-section").unwrap();
+        let result = rc.check_repost(&u4, 1u64.into()).await;
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_preserve_full_url_hosts() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        // Add example.com to preserve_full_url_hosts
+        rc.admin_add_preserve_full_url("example.com").await.unwrap();
+
+        // Add a URL with query string
+        let u1 = url::Url::parse("https://example.com/page?id=123").unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+
+        // Try to check for the same URL with different query params - should NOT match
+        let u2 = url::Url::parse("https://example.com/page?id=456").unwrap();
+        let result = rc.check_repost(&u2, 1u64.into()).await;
+        assert!(result.is_none());
+
+        // Try with exact same URL - should match
+        let u3 = url::Url::parse("https://example.com/page?id=123").unwrap();
+        let result = rc.check_repost(&u3, 1u64.into()).await;
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("har postats 1 gång"));
+
+        // Add the second URL
+        rc.add_url(&u2, 456.into(), 1u64.into()).await.unwrap();
+
+        // Now check again - should only find the exact match
+        let result = rc.check_repost(&u2, 1u64.into()).await;
+        assert!(result.is_some());
+
+        let result_text = result.unwrap();
+        assert!(result_text.contains("har postats 1 gång")); // Only 1 match, not 2
     }
 }
