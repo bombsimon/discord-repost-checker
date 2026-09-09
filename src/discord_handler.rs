@@ -32,7 +32,10 @@ impl EventHandler for Handler {
             return;
         }
 
-        let messages = self.get_messages_to_send(&ctx, &message).await;
+        // Guaranteed by the guild_id check above.
+        let guild_id = message.guild_id.expect("message must have a guild_id here");
+
+        let messages = self.get_messages_to_send(&ctx, &message, guild_id).await;
 
         for message_text in messages {
             let msg = CreateMessage::new()
@@ -70,14 +73,20 @@ impl EventHandler for Handler {
         };
 
         if let Some(response) = response
-            && let Err(err) = message.channel_id.say(&ctx, response).await {
-                log::error!("Failed to send message: {err:?}");
-            }
+            && let Err(err) = message.channel_id.say(&ctx, response).await
+        {
+            log::error!("Failed to send message: {err:?}");
+        }
     }
 }
 
 impl Handler {
-    async fn get_messages_to_send(&self, ctx: &Context, message: &Message) -> Vec<String> {
+    async fn get_messages_to_send(
+        &self,
+        ctx: &Context,
+        message: &Message,
+        guild_id: GuildId,
+    ) -> Vec<String> {
         let bot_id = ctx.cache().unwrap().current_user().id;
         if message.mentions.iter().any(|u| u.id == bot_id) {
             if message.content.ends_with("stats") {
@@ -112,7 +121,13 @@ impl Handler {
 
             if let Err(err) = self
                 .repost_checker
-                .add_url(&u, message.author.id, message.channel_id)
+                .add_url(
+                    &u,
+                    message.author.id,
+                    message.channel_id,
+                    guild_id,
+                    message.id,
+                )
                 .await
             {
                 log::error!("Failed to add URL: {err}");
@@ -210,14 +225,15 @@ impl Handler {
         // Check all guilds where the bot and user are both present
         for guild_id in ctx.cache.guilds() {
             if let Ok(member) = guild_id.member(ctx, user_id).await
-                && let Ok(guild) = guild_id.to_partial_guild(ctx).await {
-                    // This is in fact no longer deprecated: https://github.com/serenity-rs/serenity/pull/3314
-                    #[allow(deprecated)]
-                    let permissions = guild.member_permissions(&member);
-                    if permissions.administrator() {
-                        return true;
-                    }
+                && let Ok(guild) = guild_id.to_partial_guild(ctx).await
+            {
+                // This is in fact no longer deprecated: https://github.com/serenity-rs/serenity/pull/3314
+                #[allow(deprecated)]
+                let permissions = guild.member_permissions(&member);
+                if permissions.administrator() {
+                    return true;
                 }
+            }
         }
 
         false

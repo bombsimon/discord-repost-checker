@@ -31,32 +31,10 @@ impl RepostChecker {
             SqlitePool::connect_with(options).await?
         };
 
-        // Create tables if they don't exist
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS reposts (
-                url TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                posted_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS ignore_hosts (
-                host TEXT PRIMARY KEY
-            );
-
-            CREATE TABLE IF NOT EXISTS always_enabled_hosts (
-                host TEXT PRIMARY KEY
-            );
-
-            CREATE TABLE IF NOT EXISTS preserve_full_url_hosts (
-                host TEXT PRIMARY KEY
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_reposts_url ON reposts(url);
-            "#,
-        )
-        .execute(&pool)
-        .await?;
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(|err| sqlx::Error::Migrate(Box::new(err)))?;
 
         Ok(Self { pool })
     }
@@ -76,6 +54,19 @@ impl RepostChecker {
         sanitized.set_query(None);
         sanitized.set_fragment(None);
         sanitized.to_string()
+    }
+
+    /// Build a Discord jump link back to the original message from a `reposts` row, if it
+    /// has `guild_id`, `channel_id` and `message_id` recorded.
+    fn jump_link(row: &sqlx::sqlite::SqliteRow) -> Option<String> {
+        let guild_id: Option<String> = row.get("guild_id");
+        let channel_id: Option<String> = row.get("channel_id");
+        let message_id: Option<String> = row.get("message_id");
+
+        Some(format!(
+            "https://discord.com/channels/{}/{}/{}",
+            guild_id?, channel_id?, message_id?
+        ))
     }
 
     /// Check if the passed URL has been posted before. If so, return a message saying how many
@@ -106,16 +97,20 @@ impl RepostChecker {
         // Get all reposts for this URL
         let reposts = if preserve_full_url {
             // Use exact match for hosts that need full URL matching
-            sqlx::query("SELECT user_id, posted_at FROM reposts WHERE url = ? ORDER BY posted_at")
-                .bind(&url_str)
-                .fetch_all(&self.pool)
-                .await
-                .ok()?
+            sqlx::query(
+                "SELECT user_id, posted_at, guild_id, channel_id, message_id \
+                 FROM reposts WHERE url = ? ORDER BY posted_at",
+            )
+            .bind(&url_str)
+            .fetch_all(&self.pool)
+            .await
+            .ok()?
         } else {
             // Use LIKE query to match URLs ignoring query strings and fragments
             let sanitized = Self::sanitize_url(u);
             sqlx::query(
-                "SELECT user_id, posted_at FROM reposts WHERE url LIKE ? ORDER BY posted_at",
+                "SELECT user_id, posted_at, guild_id, channel_id, message_id \
+                 FROM reposts WHERE url LIKE ? ORDER BY posted_at",
             )
             .bind(format!("{sanitized}%"))
             .fetch_all(&self.pool)
@@ -135,7 +130,13 @@ impl RepostChecker {
                 let user_id: String = row.get("user_id");
                 let posted_at: String = row.get("posted_at");
                 let uid = UserId::from(user_id.parse::<u64>().unwrap_or(0)).mention();
-                format!("- {uid} - {posted_at}")
+
+                // Rows posted before message_id/channel_id/guild_id were tracked have no
+                // jump link to fall back on.
+                match Self::jump_link(row) {
+                    Some(link) => format!("- {uid} - {posted_at} - {link}"),
+                    None => format!("- {uid} - {posted_at}"),
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -150,20 +151,31 @@ impl RepostChecker {
         &self,
         u: &url::Url,
         user_id: UserId,
-        _channel_id: ChannelId,
+        channel_id: ChannelId,
+        guild_id: GuildId,
+        message_id: MessageId,
     ) -> Result<(), sqlx::Error> {
         let url_str = u.to_string();
         let user_id_str = user_id.to_string();
+        let channel_id_str = channel_id.to_string();
+        let guild_id_str = guild_id.to_string();
+        let message_id_str = message_id.to_string();
         let now = chrono::offset::Local::now()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
-        sqlx::query("INSERT INTO reposts (url, user_id, posted_at) VALUES (?, ?, ?)")
-            .bind(&url_str)
-            .bind(&user_id_str)
-            .bind(&now)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO reposts (url, user_id, posted_at, message_id, channel_id, guild_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&url_str)
+        .bind(&user_id_str)
+        .bind(&now)
+        .bind(&message_id_str)
+        .bind(&channel_id_str)
+        .bind(&guild_id_str)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -625,8 +637,48 @@ mod test {
         let u = url::Url::parse("https://svt.se").unwrap();
         assert!(rc.check_repost(&u, 1u64.into()).await.is_none());
 
-        rc.add_url(&u, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
         assert!(rc.check_repost(&u, 1u64.into()).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_check_repost_jump_link() {
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        let u = url::Url::parse("https://svt.se").unwrap();
+
+        rc.add_url(&u, 123.into(), 42.into(), 7.into(), 999.into())
+            .await
+            .unwrap();
+
+        let result = rc.check_repost(&u, 1u64.into()).await.unwrap();
+        assert!(result.contains("https://discord.com/channels/7/42/999"));
+    }
+
+    #[tokio::test]
+    async fn test_check_repost_without_message_id() {
+        // Rows written before message_id/channel_id/guild_id were tracked have those
+        // columns as NULL - make sure that degrades to no link instead of panicking.
+        let rc = RepostChecker::new_with_url("sqlite::memory:")
+            .await
+            .unwrap();
+
+        let u = url::Url::parse("https://svt.se").unwrap();
+
+        sqlx::query("INSERT INTO reposts (url, user_id, posted_at) VALUES (?, ?, ?)")
+            .bind(u.to_string())
+            .bind("123")
+            .bind("2024-01-01 00:00:00")
+            .execute(&rc.pool)
+            .await
+            .unwrap();
+
+        let result = rc.check_repost(&u, 1u64.into()).await.unwrap();
+        assert!(!result.contains("https://discord.com"));
     }
 
     #[tokio::test]
@@ -638,11 +690,19 @@ mod test {
         let u1 = url::Url::parse("https://svt.se").unwrap();
         let u2 = url::Url::parse("https://aftonbladet.se").unwrap();
 
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u1, 456.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u1, 789.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u1, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u1, 789.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
-        rc.add_url(&u2, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u2, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         let expected = r#"Totalt har det postats 2 unika länkar
 - <@456>: 2 (1 reposts, 50%)
@@ -699,9 +759,15 @@ mod test {
         let u2 = url::Url::parse("https://stackoverflow.com/questions/123").unwrap();
         let u3 = url::Url::parse("https://github.com/another").unwrap();
 
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u2, 456.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u3, 789.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u2, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u3, 789.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         let result = rc.top_domains().await;
         assert!(result.contains("1. github.com (2 länkar)"));
@@ -724,9 +790,15 @@ mod test {
         let u2 = url::Url::parse("https://example.com/2").unwrap();
         let u3 = url::Url::parse("https://example.com/3").unwrap();
 
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u2, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u3, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u2, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u3, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         let result = rc.top_users().await;
         assert!(result.contains("1. <@123> (2 länkar)"));
@@ -744,7 +816,9 @@ mod test {
 
         // Add a URL for today
         let u1 = url::Url::parse("https://example.com").unwrap();
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         let result = rc.today_stats().await;
         assert!(result.contains("Idag har det postats 1 länkar"));
@@ -769,15 +843,29 @@ mod test {
         let u6 = url::Url::parse("https://stackoverflow.com/q2").unwrap();
 
         // User 123 posts to github (3 times) and stackoverflow (1 time)
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u2, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u5, 123.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u3, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u2, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u5, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u3, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         // User 456 posts to stackoverflow (2 times) and reddit (1 time)
-        rc.add_url(&u6, 456.into(), 1u64.into()).await.unwrap();
-        rc.add_url(&u3, 456.into(), 1u64.into()).await.unwrap(); // repost
-        rc.add_url(&u4, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u6, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
+        rc.add_url(&u3, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap(); // repost
+        rc.add_url(&u4, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         let result = rc.top_domains_by_user().await;
         assert!(result.contains("Top domäner per användare:"));
@@ -794,7 +882,9 @@ mod test {
         // Add a URL with query string and fragment
         let u1 =
             url::Url::parse("https://example.com/page?utm_source=twitter&foo=bar#section").unwrap();
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         // Try to check for the same URL with different query params - should match by default
         let u2 = url::Url::parse("https://example.com/page?different=params").unwrap();
@@ -824,7 +914,9 @@ mod test {
 
         // Add a URL with query string
         let u1 = url::Url::parse("https://example.com/page?id=123").unwrap();
-        rc.add_url(&u1, 123.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u1, 123.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         // Try to check for the same URL with different query params - should NOT match
         let u2 = url::Url::parse("https://example.com/page?id=456").unwrap();
@@ -838,7 +930,9 @@ mod test {
         assert!(result.unwrap().contains("har postats 1 gång"));
 
         // Add the second URL
-        rc.add_url(&u2, 456.into(), 1u64.into()).await.unwrap();
+        rc.add_url(&u2, 456.into(), 1u64.into(), 1u64.into(), 1u64.into())
+            .await
+            .unwrap();
 
         // Now check again - should only find the exact match
         let result = rc.check_repost(&u2, 1u64.into()).await;
