@@ -42,3 +42,5 @@ You can react to a repost message by the bot to configure specific domains.
 - `@bot top users` - Show top 5 users by link count
 - `@bot top user-domains` - Show top domains for each user
 - `@bot today` - Show number of links posted today
+
+_[Icon by Magnific - Flaticon](https://www.flaticon.com/free-icons/repost)_
